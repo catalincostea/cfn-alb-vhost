@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Cfn syntax candy for ALB vhost routing
+Resources:
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt Role.Arn
+      Runtime: nodejs4.3
+      Timeout: 60
+      Code:
+        ZipFile: >
+          var response = require('cfn-response');
+          var aws = require('aws-sdk');
+
+          exports.handler = function(event, context) {
+              console.log(JSON.stringify(event));
+
+              var alb = new aws.ELBv2();
+              var props = event.ResourceProperties;
+
+              var cb = function(err, resp) {
+                  if (err) {
+                      console.log(err);
+                      response.send(event, context, response.FAILED, {}, "norule");
+                  } else {
+                      var rule = resp.Rules[0];
+                      var ruleArn = rule.RuleArn;
+                      var cfnRespData = { RuleArn: ruleArn, Priority: rule.Priority };   
+
+                      response.send(event, context, response.SUCCESS, cfnRespData, ruleArn);   
+                  }
+              };
+
+              var ruleActions = [{ TargetGroupArn: props.TargetGroupArn, Type: "forward" }];
+              var ruleConditions = [{ Field: "host-header", Values: [props.HostHeader] }];
+
+              if (event.RequestType == "Create") {
+                  alb.describeRules({ ListenerArn: props.ListenerArn }, function(err, resp) {
+                      if (err) {
+                          console.log(err);
+                          response.send(event, context, response.FAILED, {});
+                      } else {
+                          var maxPriority = resp.Rules.reduce(function(acc, rule) {
+                              var rulePriority = rule.IsDefault ? 0 : rule.Priority;
+                              return Math.max(acc, rulePriority);
+                          }, 0);
+                          var priority = maxPriority + 1;
+                          
+                          var params = {
+                              ListenerArn: props.ListenerArn,
+                              Priority: priority,
+                              Actions: ruleActions,
+                              Conditions: ruleConditions
+                          };
+
+                          console.log(JSON.stringify(params));
+                          alb.createRule(params, cb);
+                      }
+
+                  });
+
+              } else if (event.RequestType == "Update") {
+                  var params = {
+                      RuleArn: event.PhysicalResourceId,
+                      Actions: ruleActions,
+                      Conditions: ruleConditions
+                  };
+
+                  console.log(JSON.stringify(params));
+                  alb.modifyRule(params, cb);
+              } else if (event.RequestType == "Delete") {
+                  var ruleArn = event.PhysicalResourceId;
+                  
+                  if (ruleArn == "norule") {
+                    response.send(event, context, response.SUCCESS, {});
+                    return;
+                  }
+
+                  alb.deleteRule({ RuleArn: ruleArn }, function(err, resp) {
+                      if (err) {
+                          console.log(err);
+                          response.send(event, context, response.FAILED, {});
+                      } else {
+                          response.send(event, context, response.SUCCESS, {});   
+                      }
+                  });
+              }
+          };
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateRule
+                  - elasticloadbalancing:ModifyRule
+                  - elasticloadbalancing:DeleteRule
+                  - elasticloadbalancing:DescribeRules
+                Resource: "*"
+Outputs:
+  Lambda:
+    Value: !GetAtt Lambda.Arn
+    Export:
+      Name: AlbVhost
